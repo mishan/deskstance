@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""System tray applet for desks with a Linak DPG controller, such as the iMovR Lander."""
+
+import argparse
+import asyncio
+import logging
+import math
+import struct
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("AyatanaAppIndicator3", "0.1")
+from gi.events import GLibEventLoopPolicy
+from gi.repository import AyatanaAppIndicator3 as AppIndicator
+from gi.repository import Gtk
+
+from bleak import BleakClient
+from bleak.exc import BleakError
+from dbus_fast import BusType
+from dbus_fast.aio import MessageBus
+
+log = logging.getLogger("deskstance")
+
+
+def _uuid(n):
+    return f"99fa{n:04x}-338a-1024-8a49-009c0215f78a"
+
+
+CONTROL_SERVICE = _uuid(0x01)
+CONTROL = _uuid(0x02)
+DPG = _uuid(0x11)
+HEIGHT = _uuid(0x21)
+TARGET = _uuid(0x31)
+
+CMD_WAKEUP = b"\xfe\x00"
+CMD_STOP = b"\xff\x00"
+
+DPG_CAPABILITIES = 0x80
+DPG_OFFSET = 0x81
+DPG_USER_ID = 0x86
+DPG_SETTINGS = 0x88
+DPG_MEMORY_1 = 0x89
+SETTINGS_INCH = 0x04
+
+RECONNECT_DELAY = 5
+PRESET_REFRESH = 60
+
+
+async def find_paired_desk():
+    """Return the address of the first paired Bluetooth device that is a Linak desk."""
+    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    try:
+        bluez = bus.get_proxy_object("org.bluez", "/", await bus.introspect("org.bluez", "/"))
+        objects = await bluez.get_interface("org.freedesktop.DBus.ObjectManager").call_get_managed_objects()
+    finally:
+        bus.disconnect()
+    for interfaces in objects.values():
+        device = interfaces.get("org.bluez.Device1", {})
+        if "Paired" in device and device["Paired"].value and CONTROL_SERVICE in device.get("UUIDs").value:
+            return device["Address"].value
+    return None
+
+
+def format_height(raw, inches):
+    """Format a height in 0.1 mm the way the paddle display shows it."""
+    value = raw / 254 if inches else raw / 100
+    return f"{math.floor(value * 10 + 0.5) / 10:.1f} {'in' if inches else 'cm'}"
+
+
+class Desk:
+    """A connection to a Linak DPG desk. Heights are in 0.1 mm above the floor."""
+
+    def __init__(self, address, on_change):
+        self.address = address
+        self.on_change = on_change
+        self.client = None
+        self.offset = 0
+        self.position = None  # relative to the lowest position, as the desk reports it
+        self.speed = 0
+        self.inches = False
+        self.presets = []  # absolute heights; None for unset slots
+        self._slots = 0
+        self._dpg_lock = asyncio.Lock()
+        self._dpg_replies = asyncio.Queue()
+
+    @property
+    def connected(self):
+        return self.client is not None and self.client.is_connected
+
+    @property
+    def height(self):
+        return None if self.position is None else self.position + self.offset
+
+    async def run(self):
+        while True:
+            disconnected = asyncio.Event()
+            try:
+                address = self.address or await find_paired_desk()
+                if address is None:
+                    raise BleakError("no paired Linak desk found")
+                self.client = BleakClient(address, lambda _: disconnected.set(), timeout=20)
+                await self.client.connect()
+                await self._setup()
+                self.on_change()
+                while not disconnected.is_set():
+                    try:
+                        await asyncio.wait_for(disconnected.wait(), PRESET_REFRESH)
+                    except TimeoutError:
+                        await self.read_presets()
+            except (BleakError, TimeoutError, OSError) as e:
+                log.warning("desk connection failed: %s", e)
+            if self.client:
+                await self.client.disconnect()
+            self.client = None
+            self.on_change()
+            await asyncio.sleep(RECONNECT_DELAY)
+
+    async def _setup(self):
+        await self.client.start_notify(DPG, lambda _, data: self._dpg_replies.put_nowait(data))
+
+        # DPG1C panels ignore movement commands unless the user ID starts with 1.
+        user_id = await self._dpg(DPG_USER_ID)
+        if user_id and user_id[0] != 1:
+            await self._dpg(DPG_USER_ID, b"\x01" + user_id[1:])
+
+        offset = await self._dpg(DPG_OFFSET)
+        self.offset = struct.unpack("<H", offset[1:3])[0] if offset and offset[0] == 1 else 0
+        self.inches = bool((await self._dpg(DPG_SETTINGS))[0] & SETTINGS_INCH)
+        self._slots = (await self._dpg(DPG_CAPABILITIES))[0] & 0x07
+        await self.read_presets()
+
+        self._on_height(None, await self.client.read_gatt_char(HEIGHT))
+        await self.client.start_notify(HEIGHT, self._on_height)
+
+    async def _dpg(self, command, data=None):
+        """Send a DPG command and return the reply payload, or None if the desk rejected it."""
+        async with self._dpg_lock:
+            while not self._dpg_replies.empty():
+                self._dpg_replies.get_nowait()
+            if data is None:
+                await self.client.write_gatt_char(DPG, bytes([0x7F, command, 0x00]))
+            else:
+                await self.client.write_gatt_char(DPG, bytes([0x7F, command, 0x80]) + data)
+            reply = await asyncio.wait_for(self._dpg_replies.get(), 5)
+            return reply[2:] if reply[0] == 1 else None
+
+    async def read_presets(self):
+        presets = []
+        for slot in range(self._slots):
+            reply = await self._dpg(DPG_MEMORY_1 + slot)
+            if reply and reply[0] == 1:
+                presets.append(struct.unpack("<H", reply[1:3])[0] + self.offset)
+            else:
+                presets.append(None)
+        if presets != self.presets:
+            self.presets = presets
+            self.on_change()
+
+    async def save_preset(self, slot):
+        await self._dpg(DPG_MEMORY_1 + slot, b"\x01" + struct.pack("<H", self.position))
+        await self.read_presets()
+
+    def _on_height(self, _, data):
+        was_moving = self.speed != 0
+        self.position, self.speed = struct.unpack("<Hh", data[:4])
+        self.on_change()
+        if was_moving and self.speed == 0:
+            # Presets may have been saved on the paddle while we weren't looking.
+            asyncio.ensure_future(self.read_presets())
+
+    async def move_to(self, height):
+        target = struct.pack("<H", height - self.offset)
+        await self.client.write_gatt_char(CONTROL, CMD_WAKEUP)
+        await self.client.write_gatt_char(CONTROL, CMD_STOP)
+        try:
+            # The controller stops unless the target is resent periodically.
+            while True:
+                await self.client.write_gatt_char(TARGET, target)
+                await asyncio.sleep(0.5)
+                if self.speed == 0:
+                    return
+        except asyncio.CancelledError:
+            await self.client.write_gatt_char(CONTROL, CMD_STOP)
+            raise
+
+
+class Tray:
+    def __init__(self, address):
+        self.desk = Desk(address, self.refresh)
+        self.move_task = None
+
+        self.indicator = AppIndicator.Indicator.new(
+            "deskstance", "deskstance-symbolic", AppIndicator.IndicatorCategory.HARDWARE
+        )
+        self.indicator.set_icon_theme_path(str(Path(__file__).resolve().parent / "icons"))
+        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+
+        self.menu = Gtk.Menu()
+        self.status_item = Gtk.MenuItem(sensitive=False)
+        self.preset_items = []
+        self.preset_separator = Gtk.SeparatorMenuItem()
+        self.save_item = Gtk.MenuItem(label="Save current height to")
+        self.save_item.set_submenu(Gtk.Menu())
+        self.stop_item = Gtk.MenuItem(label="Stop")
+        self.stop_item.connect("activate", lambda _: self.move_task and self.move_task.cancel())
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", lambda _: asyncio.get_event_loop().stop())
+        for item in (self.status_item, self.preset_separator, self.save_item, self.stop_item,
+                     Gtk.SeparatorMenuItem(), quit_item):
+            self.menu.append(item)
+        self.menu.show_all()
+        self.indicator.set_menu(self.menu)
+        self.refresh()
+
+    def refresh(self):
+        desk = self.desk
+        connected = desk.connected and desk.height is not None
+        label = format_height(desk.height, desk.inches) if connected else "--"
+        self.indicator.set_label(label, "000.0 cm")
+        self.status_item.set_label(f"Height: {label}" if connected else "Desk disconnected")
+        self.save_item.set_sensitive(connected and desk.speed == 0)
+        self.stop_item.set_sensitive(self.move_task is not None and not self.move_task.done())
+
+        if len(self.preset_items) != len(desk.presets):
+            self._rebuild_presets()
+        current = format_height(desk.height, desk.inches) if connected and desk.speed == 0 else None
+        for slot, (item, height) in enumerate(zip(self.preset_items, desk.presets)):
+            text = format_height(height, desk.inches) if height is not None else "not set"
+            item.handler_block_by_func(self._on_preset)
+            item.set_label(f"{slot + 1}: {text}")
+            item.set_active(height is not None and format_height(height, desk.inches) == current)
+            item.set_sensitive(connected and height is not None)
+            item.handler_unblock_by_func(self._on_preset)
+
+    def _rebuild_presets(self):
+        for item in self.preset_items:
+            self.menu.remove(item)
+        self.preset_items = []
+        save_menu = Gtk.Menu()
+        for slot in range(len(self.desk.presets)):
+            item = Gtk.CheckMenuItem(draw_as_radio=True)
+            item.connect("activate", self._on_preset, slot)
+            self.menu.insert(item, slot + 1)
+            self.preset_items.append(item)
+            save = Gtk.MenuItem(label=f"Preset {slot + 1}")
+            save.connect("activate", lambda _, s=slot: self._spawn(self.desk.save_preset(s)))
+            save_menu.append(save)
+        self.save_item.set_submenu(save_menu)
+        self.menu.show_all()
+
+    def _on_preset(self, _, slot):
+        if self.move_task:
+            self.move_task.cancel()
+        self.move_task = self._spawn(self.desk.move_to(self.desk.presets[slot]))
+        self.refresh()
+
+    def _spawn(self, coro):
+        task = asyncio.ensure_future(coro)
+        task.add_done_callback(self._on_task_done)
+        return task
+
+    def _on_task_done(self, task):
+        if not task.cancelled() and task.exception():
+            log.error("desk command failed: %s", task.exception())
+        self.refresh()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("address", nargs="?", help="Bluetooth address of the desk (default: the paired desk)")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
+
+    loop = GLibEventLoopPolicy().get_event_loop()
+    asyncio.set_event_loop(loop)
+    tray = Tray(args.address)
+    loop.create_task(tray.desk.run())
+    loop.run_forever()
+
+
+if __name__ == "__main__":
+    main()

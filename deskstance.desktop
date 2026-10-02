@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Deskstance
+Comment=Standing desk height and presets
+Exec=deskstance
+Icon=deskstance-symbolic
+Categories=Utility;
+X-GNOME-Autostart-enabled=true
