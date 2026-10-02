@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import itertools
 import logging
 import math
 import struct
@@ -58,9 +59,14 @@ async def find_paired_desk():
         bus.disconnect()
     for interfaces in objects.values():
         device = interfaces.get("org.bluez.Device1", {})
-        if "Paired" in device and device["Paired"].value and CONTROL_SERVICE in device.get("UUIDs").value:
+        if "UUIDs" in device and device["Paired"].value and CONTROL_SERVICE in device["UUIDs"].value:
             return device["Address"].value
     return None
+
+
+def log_failure(task):
+    if not task.cancelled() and task.exception():
+        log.error("desk command failed: %s", task.exception())
 
 
 def format_height(raw, inches):
@@ -109,13 +115,19 @@ class Desk:
                         await asyncio.wait_for(disconnected.wait(), PRESET_REFRESH)
                     except TimeoutError:
                         await self.read_presets()
-            except (BleakError, TimeoutError, OSError) as e:
+            except Exception as e:
                 log.warning("desk connection failed: %s", e)
-            if self.client:
-                await self.client.disconnect()
+            await self.disconnect()
             self.client = None
             self.on_change()
             await asyncio.sleep(RECONNECT_DELAY)
+
+    async def disconnect(self):
+        if self.client:
+            try:
+                await self.client.disconnect()
+            except Exception as e:
+                log.debug("disconnect failed: %s", e)
 
     async def _setup(self):
         await self.client.start_notify(DPG, lambda _, data: self._dpg_replies.put_nowait(data))
@@ -143,7 +155,12 @@ class Desk:
                 await self.client.write_gatt_char(DPG, bytes([0x7F, command, 0x00]))
             else:
                 await self.client.write_gatt_char(DPG, bytes([0x7F, command, 0x80]) + data)
-            reply = await asyncio.wait_for(self._dpg_replies.get(), 5)
+            try:
+                reply = await asyncio.wait_for(self._dpg_replies.get(), 5)
+            except TimeoutError:
+                # A late reply would be mistaken for the next command's, so start over.
+                await self.disconnect()
+                raise
             return reply[2:] if reply[0] == 1 else None
 
     async def read_presets(self):
@@ -168,18 +185,21 @@ class Desk:
         self.on_change()
         if was_moving and self.speed == 0:
             # Presets may have been saved on the paddle while we weren't looking.
-            asyncio.ensure_future(self.read_presets())
+            asyncio.ensure_future(self.read_presets()).add_done_callback(log_failure)
 
     async def move_to(self, height):
         target = struct.pack("<H", height - self.offset)
         await self.client.write_gatt_char(CONTROL, CMD_WAKEUP)
         await self.client.write_gatt_char(CONTROL, CMD_STOP)
+        moved = False
         try:
-            # The controller stops unless the target is resent periodically.
-            while True:
+            # The controller stops unless the target is resent periodically. The first
+            # speed notification can lag, so give the desk a few rounds to start moving.
+            for attempt in itertools.count():
                 await self.client.write_gatt_char(TARGET, target)
                 await asyncio.sleep(0.5)
-                if self.speed == 0:
+                moved = moved or self.speed != 0
+                if self.speed == 0 and (moved or attempt >= 4):
                     return
         except asyncio.CancelledError:
             await self.client.write_gatt_char(CONTROL, CMD_STOP)
@@ -262,8 +282,7 @@ class Tray:
         return task
 
     def _on_task_done(self, task):
-        if not task.cancelled() and task.exception():
-            log.error("desk command failed: %s", task.exception())
+        log_failure(task)
         self.refresh()
 
 
@@ -278,7 +297,12 @@ def main():
     asyncio.set_event_loop(loop)
     tray = Tray(args.address)
     loop.create_task(tray.desk.run())
-    loop.run_forever()
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        pass
+    # Release the desk's only connection so the phone app can use it.
+    loop.run_until_complete(tray.desk.disconnect())
 
 
 if __name__ == "__main__":
