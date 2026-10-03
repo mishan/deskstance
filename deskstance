@@ -108,6 +108,9 @@ class Desk:
                     raise BleakError("no paired Linak desk found")
                 self.client = BleakClient(address, lambda _: disconnected.set(), timeout=20)
                 await self.client.connect()
+                # bleak retries aborted connection attempts internally, and each one
+                # still fires the disconnected callback.
+                disconnected.clear()
                 await self._setup()
                 self.on_change()
                 while not disconnected.is_set():
@@ -130,6 +133,9 @@ class Desk:
                 log.debug("disconnect failed: %s", e)
 
     async def _setup(self):
+        # While the control box is in standby, the paddle drops connections within
+        # seconds. Waking it doesn't move the desk.
+        await self.client.write_gatt_char(CONTROL, CMD_WAKEUP)
         await self.client.start_notify(DPG, lambda _, data: self._dpg_replies.put_nowait(data))
 
         # DPG1C panels ignore movement commands unless the user ID starts with 1.
